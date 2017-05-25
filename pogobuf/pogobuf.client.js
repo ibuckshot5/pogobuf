@@ -105,7 +105,7 @@ function Client(options) {
      * @param {boolean} [appSimulation] - Deprecated, use appSimulation option instead
      * @return {Promise} promise
      */
-    this.init = function(appSimulation) {
+    this.init = async function(appSimulation) {
         // For backwards compatibility only
         if (typeof appSimulation !== 'undefined') self.setOption('appSimulation', appSimulation);
 
@@ -127,8 +127,6 @@ function Client(options) {
         self.signatureEncryption.encryptAsync = Promise.promisify(self.signatureEncryption.encrypt,
                                                                 { context: self.signatureEncryption });
 
-        let promise = Promise.resolve(true);
-
         // Handle login here if no auth token is provided
         if (!self.options.authToken) {
             if (!self.options.username || !self.options.password) throw new Error('No token nor credentials provided.');
@@ -141,33 +139,29 @@ function Client(options) {
             }
             if (self.options.proxy) self.login.setProxy(self.options.proxy);
 
-            promise = promise
-                        .then(() => self.login.login(self.options.username, self.options.password)
-                        .then(token => {
-                            self.options.authToken = token;
-                        }));
+            let token = await self.login.login(self.options.username, self.options.password);
+            self.options.authToken = token;
         }
 
         if (self.options.useHashingServer) {
-            promise = promise.then(self.initializeHashingServer);
+            await self.initializeHashingServer();
         }
 
         if (self.options.appSimulation) {
             const ios = POGOProtos.Enums.Platform.IOS;
             const version = +self.options.version;
-            promise = promise.then(() => self.batchStart().batchCall())
-                        .then(() => self.getPlayer('US', 'en', 'Europe/Paris'))
-                        .then(() => self.batchStart()
-                                        .downloadRemoteConfigVersion(ios, '', '', '', version)
-                                        .checkChallenge()
-                                        .getHatchedEggs()
-                                        .getInventory()
-                                        .checkAwardedBadges()
-                                        .downloadSettings()
-                                        .batchCall());
-        }
 
-        return promise;
+            await self.batchStart().batchCall();
+            await self.getPlayer('US', 'en', 'Europe/Paris');
+            await self.batchStart()
+                      .downloadRemoteConfigVersion(ios, '', '', '', version)
+                      .checkChallenge()
+                      .getHatchedEggs()
+                      .getInventory()
+                      .checkAwardedBadges()
+                      .downloadSettings()
+                      .batchCall();
+        }
     };
 
     /**
@@ -1126,18 +1120,15 @@ function Client(options) {
      * @param {ResponseEnvelope} responseEnvelope - Result from API call
      * @return {Promise}
      */
-    this.redirect = function(requests, signedEnvelope, responseEnvelope) {
-        return new Promise((resolve, reject) => {
-            if (!responseEnvelope.api_url) {
-                reject(Error('Fetching RPC endpoint failed, none supplied in response'));
-                return;
-            }
+    this.redirect = async function(requests, signedEnvelope, responseEnvelope) {
+        if (!responseEnvelope.api_url) {
+            throw new Error('Fetching RPC endpoint failed, none supplied in response');
+        }
 
-            self.endpoint = 'https://' + responseEnvelope.api_url + '/rpc';
+        self.endpoint = 'https://' + responseEnvelope.api_url + '/rpc';
 
-            signedEnvelope.platform_requests = [];
-            resolve(self.callRPC(requests, signedEnvelope));
-        });
+        signedEnvelope.platform_requests = [];
+        return self.callRPC(requests, signedEnvelope);
     };
 
     /**
@@ -1166,134 +1157,129 @@ function Client(options) {
      * @return {Promise} - A Promise that will be resolved with the (list of) response messages,
      *     or true if there aren't any
      */
-    this.tryCallRPC = function(requests, envelope) {
-        return self.buildSignedEnvelope(requests, envelope)
-            .then(signedEnvelope =>
-                self.request.postAsync({
-                    url: self.endpoint,
-                    proxy: self.options.proxy,
-                    body: encode(signedEnvelope),
-                })
-                .then(response => ({ signedEnvelope: signedEnvelope, response: response }))
-            )
-            .then(result => {
-                const signedEnvelope = result.signedEnvelope;
-                const response = result.response;
-                if (response.statusCode !== 200) {
-                    if (response.statusCode >= 400 && response.statusCode < 500) {
-                        /* These are permanent errors so throw StopError */
-                        throw new retry.StopError(
-                            `Status code ${response.statusCode} received from HTTPS request`
-                        );
-                    } else {
-                        /* Anything else might be recoverable so throw regular Error */
-                        throw new Error(
-                            `Status code ${response.statusCode} received from HTTPS request`
-                        );
-                    }
-                }
+    this.tryCallRPC = async function(requests, envelope) {
+        let signedEnvelope = self.buildSignedEnvelope(requests, envelope);
 
-                let responseEnvelope;
+        let response = await self.request.postAsync({
+            url: self.endpoint,
+            proxy: self.options.proxy,
+            body: encode(signedEnvelope),
+        });
+
+        if (response.statusCode !== 200) {
+            if (response.statusCode >= 400 && response.statusCode < 500) {
+                /* These are permanent errors so throw StopError */
+                throw new retry.StopError(
+                    `Status code ${response.statusCode} received from HTTPS request`
+                );
+            } else {
+                /* Anything else might be recoverable so throw regular Error */
+                throw new Error(
+                    `Status code ${response.statusCode} received from HTTPS request`
+                );
+            }
+        }
+
+        let responseEnvelope;
+        try {
+            responseEnvelope =
+                POGOProtos.Networking.Envelopes.ResponseEnvelope.decode(response.body);
+        } catch (e) {
+            if (e.decoded) {
+                responseEnvelope = e.decoded;
+            } else {
+                throw new retry.StopError(e);
+            }
+        }
+
+        if (responseEnvelope.error) {
+            throw new retry.StopError(responseEnvelope.error);
+        }
+
+        if (responseEnvelope.auth_ticket) self.authTicket = responseEnvelope.auth_ticket;
+
+        if (responseEnvelope.status_code === 53 ||
+            (responseEnvelope.status_code === 2 && self.endpoint === INITIAL_ENDPOINT)) {
+            return self.redirect(requests, signedEnvelope, responseEnvelope);
+        }
+
+        responseEnvelope.platform_returns.forEach(platformReturn => {
+            if (platformReturn.type === PlatformRequestType.UNKNOWN_PTR_8) {
+                const ptr8 = PlatformResponses.UnknownPtr8Response.decode(platformReturn.response);
+                if (ptr8) self.ptr8 = ptr8.message;
+            }
+        });
+
+        /* Auth expired, auto relogin */
+        if (responseEnvelope.status_code === 102 && self.login) {
+            signedEnvelope.platform_requests = [];
+            self.login.reset();
+            return self.login
+                        .login(self.options.username, self.options.password)
+                        .then(token => {
+                            self.options.authToken = token;
+                            self.authTicket = null;
+                            signedEnvelope.auth_ticket = null;
+                            signedEnvelope.auth_info = this.getAuthInfoObject();
+                            return self.callRPC(requests, signedEnvelope);
+                        });
+        }
+
+        /* Throttling, retry same request later */
+        if (responseEnvelope.status_code === 52 && self.endpoint !== INITIAL_ENDPOINT) {
+            signedEnvelope.platform_requests = [];
+            return Promise.delay(2000).then(() => self.callRPC(requests, signedEnvelope));
+        }
+
+        /* These codes indicate invalid input, no use in retrying so throw StopError */
+        if (responseEnvelope.status_code === 3 || responseEnvelope.status_code === 51 ||
+            responseEnvelope.status_code >= 100) {
+            throw new retry.StopError(
+                `Status code ${responseEnvelope.status_code} received from RPC`
+            );
+        }
+
+        /* These can be temporary so throw regular Error */
+        if (responseEnvelope.status_code !== 2 && responseEnvelope.status_code !== 1) {
+            throw new Error(
+                `Status code ${responseEnvelope.status_code} received from RPC`
+            );
+        }
+
+        let responses = [];
+
+        if (requests) {
+            if (requests.length !== responseEnvelope.returns.length) {
+                throw new Error('Request count does not match response count');
+            }
+
+            for (let i = 0; i < responseEnvelope.returns.length; i++) {
+                if (!requests[i].responseType) continue;
+
+                let responseMessage;
                 try {
-                    responseEnvelope =
-                        POGOProtos.Networking.Envelopes.ResponseEnvelope.decode(response.body);
+                    responseMessage = requests[i].responseType.decode(
+                        responseEnvelope.returns[i]
+                    ).toObject({ defaults: true });
                 } catch (e) {
-                    if (e.decoded) {
-                        responseEnvelope = e.decoded;
-                    } else {
-                        throw new retry.StopError(e);
-                    }
+                    throw new retry.StopError(e);
                 }
 
-                if (responseEnvelope.error) {
-                    throw new retry.StopError(responseEnvelope.error);
+                if (self.options.includeRequestTypeInResponse) {
+                    // eslint-disable-next-line no-underscore-dangle
+                    responseMessage._requestType = requests[i].type;
                 }
+                responses.push(responseMessage);
+            }
+        }
 
-                if (responseEnvelope.auth_ticket) self.authTicket = responseEnvelope.auth_ticket;
+        if (self.options.automaticLongConversion) {
+            responses = Utils.convertLongs(responses);
+        }
 
-                if (responseEnvelope.status_code === 53 ||
-                    (responseEnvelope.status_code === 2 && self.endpoint === INITIAL_ENDPOINT)) {
-                    return self.redirect(requests, signedEnvelope, responseEnvelope);
-                }
-
-                responseEnvelope.platform_returns.forEach(platformReturn => {
-                    if (platformReturn.type === PlatformRequestType.UNKNOWN_PTR_8) {
-                        const ptr8 = PlatformResponses.UnknownPtr8Response.decode(platformReturn.response);
-                        if (ptr8) self.ptr8 = ptr8.message;
-                    }
-                });
-
-                /* Auth expired, auto relogin */
-                if (responseEnvelope.status_code === 102 && self.login) {
-                    signedEnvelope.platform_requests = [];
-                    self.login.reset();
-                    return self.login
-                                .login(self.options.username, self.options.password)
-                                .then(token => {
-                                    self.options.authToken = token;
-                                    self.authTicket = null;
-                                    signedEnvelope.auth_ticket = null;
-                                    signedEnvelope.auth_info = this.getAuthInfoObject();
-                                    return self.callRPC(requests, signedEnvelope);
-                                });
-                }
-
-                /* Throttling, retry same request later */
-                if (responseEnvelope.status_code === 52 && self.endpoint !== INITIAL_ENDPOINT) {
-                    signedEnvelope.platform_requests = [];
-                    return Promise.delay(2000).then(() => self.callRPC(requests, signedEnvelope));
-                }
-
-                /* These codes indicate invalid input, no use in retrying so throw StopError */
-                if (responseEnvelope.status_code === 3 || responseEnvelope.status_code === 51 ||
-                    responseEnvelope.status_code >= 100) {
-                    throw new retry.StopError(
-                        `Status code ${responseEnvelope.status_code} received from RPC`
-                    );
-                }
-
-                /* These can be temporary so throw regular Error */
-                if (responseEnvelope.status_code !== 2 && responseEnvelope.status_code !== 1) {
-                    throw new Error(
-                        `Status code ${responseEnvelope.status_code} received from RPC`
-                    );
-                }
-
-                let responses = [];
-
-                if (requests) {
-                    if (requests.length !== responseEnvelope.returns.length) {
-                        throw new Error('Request count does not match response count');
-                    }
-
-                    for (let i = 0; i < responseEnvelope.returns.length; i++) {
-                        if (!requests[i].responseType) continue;
-
-                        let responseMessage;
-                        try {
-                            responseMessage = requests[i].responseType.decode(
-                                responseEnvelope.returns[i]
-                            ).toObject({ defaults: true });
-                        } catch (e) {
-                            throw new retry.StopError(e);
-                        }
-
-                        if (self.options.includeRequestTypeInResponse) {
-                            // eslint-disable-next-line no-underscore-dangle
-                            responseMessage._requestType = requests[i].type;
-                        }
-                        responses.push(responseMessage);
-                    }
-                }
-
-                if (self.options.automaticLongConversion) {
-                    responses = Utils.convertLongs(responses);
-                }
-
-                if (!responses.length) return true;
-                else if (responses.length === 1) return responses[0];
-                return responses;
-            });
+        if (!responses.length) return true;
+        else if (responses.length === 1) return responses[0];
+        return responses;
     };
 
     /**
@@ -1301,7 +1287,7 @@ function Client(options) {
      * @private
      * @return {Promise}
      */
-    this.initializeHashingServer = function() {
+    this.initializeHashingServer = async function() {
         if (!self.options.hashingServer) throw new Error('Hashing server enabled without host');
         if (!self.options.hashingKey) throw new Error('Hashing server enabled without key');
 
@@ -1309,62 +1295,7 @@ function Client(options) {
             self.setOption('hashingServer', self.options.hashingServer + '/');
         }
 
-        return Signature.versions.getHashingEndpoint(self.options.hashingServer, self.options.version)
-                .then(version => {
-                    self.hashingVersion = version;
-                });
-    };
-
-    /*
-     * DEPRECATED METHODS
-     */
-
-    /**
-     * Sets the authType and authToken options.
-     * @deprecated Use options object or setOption() instead
-     * @param {string} authType
-     * @param {string} authToken
-     */
-    this.setAuthInfo = function(authType, authToken) {
-        self.setOption('authType', authType);
-        self.setOption('authToken', authToken);
-    };
-
-    /**
-     * Sets the includeRequestTypeInResponse option.
-     * @deprecated Use options object or setOption() instead
-     * @param {bool} includeRequestTypeInResponse
-     */
-    this.setIncludeRequestTypeInResponse = function(includeRequestTypeInResponse) {
-        self.setOption('includeRequestTypeInResponse', includeRequestTypeInResponse);
-    };
-
-    /**
-     * Sets the maxTries option.
-     * @deprecated Use options object or setOption() instead
-     * @param {integer} maxTries
-     */
-    this.setMaxTries = function(maxTries) {
-        self.setOption('maxTries', maxTries);
-    };
-
-    /**
-     * Sets the proxy option.
-     * @deprecated Use options object or setOption() instead
-     * @param {string} proxy
-     */
-    this.setProxy = function(proxy) {
-        self.setOption('proxy', proxy);
-    };
-
-    /**
-     * Sets the automaticLongConversion option.
-     * @deprecated Use options object or setOption() instead
-     * @param {boolean} enable
-     */
-    this.setAutomaticLongConversionEnabled = function(enable) {
-        if (typeof enable !== 'boolean') return;
-        self.setOption('automaticLongConversion', enable);
+        self.hashingVersion = await Signature.versions.getHashingEndpoint(self.options.hashingServer, self.options.version);
     };
 }
 
