@@ -311,13 +311,6 @@ module.exports.defineApiCalls = function(self) {
         });
     };
 
-    self.collectDailyBonus = function() {
-        return self.callOrChain({
-            type: RequestType.COLLECT_DAILY_BONUS,
-            responseType: Responses.CollectDailyBonusResponse
-        });
-    };
-
     self.useItemXPBoost = function(itemID) {
         return self.callOrChain({
             type: RequestType.USE_ITEM_XP_BOOST,
